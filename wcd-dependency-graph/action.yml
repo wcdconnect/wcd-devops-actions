@@ -1,0 +1,302 @@
+name: 'WCD Dependency Graph'
+description: >
+  Generate a Graphviz DOT (+ SVG) graph of wcd-* NuGet dependencies for a .csproj
+  from project.assets.json. Requires a prior restore and Graphviz `dot` on PATH
+  (pre-installed on all WCD runners). Failures emit warnings and do not fail the job.
+
+branding:
+  icon: 'share-2'
+  color: 'blue'
+
+inputs:
+  project:
+    description: >
+      Path to the .csproj to analyze (relative to the workspace / repo root).
+      Example: src/wcd-goa-1gx-processor/wcd-goa-1gx-processor.csproj
+    required: true
+  filename:
+    description: >
+      Output path stem or .dot path (relative to workspace). Writes <stem>.dot and <stem>.svg.
+      Default (repeatable pattern across repos): docs/app/dependency-graph
+    required: false
+    default: 'docs/app/dependency-graph'
+  ignore:
+    description: >
+      Colon-separated package IDs to omit from the graph (nodes and edges).
+      Example: wcd-library-targets  or  wcd-library-targets:wcd-installer
+    required: false
+    default: ''
+  package_prefix:
+    description: 'Only include package IDs starting with this prefix (default: wcd-).'
+    required: false
+    default: 'wcd-'
+  skip_svg:
+    description: 'If true, write .dot only (do not invoke Graphviz).'
+    required: false
+    default: 'false'
+  working_directory:
+    description: 'Working directory for the script (default: github.workspace).'
+    required: false
+    default: ${{ github.workspace }}
+  upload_artifact:
+    description: >
+      If true, upload the generated .dot and .svg as a GitHub Actions workflow artifact.
+      Default false — prefer commit_if_changed so README images resolve without accumulating artifact storage cost.
+    required: false
+    default: 'false'
+  artifact_name:
+    description: 'Artifact name when upload_artifact is true.'
+    required: false
+    default: 'wcd-dependency-graph'
+  commit_if_changed:
+    description: >
+      If true, commit and push docs/app/dependency-graph.dot/.svg when they change.
+      Uses commit message containing [skip ci] to avoid retriggering workflows.
+      Soft-fails (warning) if git push fails.
+    required: false
+    default: 'true'
+
+outputs:
+  dot_path:
+    description: 'Absolute path to the generated .dot file'
+    value: ${{ steps.generate.outputs.dot_path }}
+  svg_path:
+    description: 'Absolute path to the generated .svg file (empty if skip_svg)'
+    value: ${{ steps.generate.outputs.svg_path }}
+  package_count:
+    description: 'Number of packages included in the graph'
+    value: ${{ steps.generate.outputs.package_count }}
+  direct_count:
+    description: 'Number of direct PackageReference packages in the graph'
+    value: ${{ steps.generate.outputs.direct_count }}
+  edge_count:
+    description: 'Number of package→package dependency edges'
+    value: ${{ steps.generate.outputs.edge_count }}
+  succeeded:
+    description: 'true when the graph was generated successfully; false when a warning was emitted'
+    value: ${{ steps.generate.outputs.succeeded }}
+  committed:
+    description: 'true when graph files were committed and pushed'
+    value: ${{ steps.commit.outputs.committed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Generate dependency graph
+      id: generate
+      shell: pwsh
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        INPUT_PROJECT: ${{ inputs.project }}
+        INPUT_FILENAME: ${{ inputs.filename }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+        INPUT_PREFIX: ${{ inputs.package_prefix }}
+        INPUT_SKIP_SVG: ${{ inputs.skip_svg }}
+      run: |
+        # Soft-fail: Graphviz missing / assets missing / script errors → ::warning, exit 0
+        $ErrorActionPreference = 'Continue'
+        function Write-GraphWarning([string] $Message) {
+          Write-Host "::warning title=WCD Dependency Graph::$Message"
+          if ($env:GITHUB_STEP_SUMMARY) {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Dependency graph skipped/failed (non-blocking):** $Message" -Encoding utf8
+          }
+          "succeeded=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "dot_path=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "svg_path=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "package_count=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "direct_count=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "edge_count=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        }
+
+        try {
+          $script = Join-Path '${{ github.action_path }}' 'create-dependency-graph.ps1'
+          if (-not (Test-Path -LiteralPath $script)) {
+            Write-GraphWarning "Script missing at $script. Ensure create-dependency-graph.ps1 is next to action.yml."
+            exit 0
+          }
+
+          $project = if ($env:INPUT_PROJECT) { $env:INPUT_PROJECT.Trim() } else { '' }
+          $filename = if ($env:INPUT_FILENAME) { $env:INPUT_FILENAME.Trim() } else { '' }
+          if (-not $filename) { $filename = 'docs/app/dependency-graph' }
+          $ignore = if ($env:INPUT_IGNORE) { $env:INPUT_IGNORE.Trim() } else { '' }
+          $prefix = if ($env:INPUT_PREFIX) { $env:INPUT_PREFIX.Trim() } else { '' }
+          if (-not $prefix) { $prefix = 'wcd-' }
+          $skipSvg = $false
+          if ($env:INPUT_SKIP_SVG) {
+            $skipSvg = $env:INPUT_SKIP_SVG.Trim().ToLowerInvariant() -in @('true', '1', 'yes')
+          }
+
+          Write-Host "=== WCD Dependency Graph ==="
+          Write-Host "Working directory : $(Get-Location)"
+          Write-Host "Project           : $project"
+          Write-Host "Filename          : $filename"
+          Write-Host "Ignore            : $(if ($ignore) { $ignore } else { '(none)' })"
+          Write-Host "Package prefix    : $prefix"
+          Write-Host "Skip SVG          : $skipSvg"
+          Write-Host "Script            : $script"
+          $dotCmd = Get-Command dot -ErrorAction SilentlyContinue
+          Write-Host "dot on PATH       : $(if ($dotCmd) { $dotCmd.Source } else { '(NOT FOUND)' })"
+
+          if (-not $project) {
+            Write-GraphWarning "inputs.project is required."
+            exit 0
+          }
+          if (-not (Test-Path -LiteralPath $project)) {
+            Write-GraphWarning "Project not found: $project. Pass a path relative to the repo root after checkout."
+            exit 0
+          }
+
+          $assets = Join-Path (Split-Path -Parent (Resolve-Path $project)) 'obj\project.assets.json'
+          if (-not (Test-Path -LiteralPath $assets)) {
+            Write-GraphWarning "project.assets.json missing: $assets. Run 'dotnet restore' before this action."
+            exit 0
+          }
+
+          if (-not $dotCmd -and -not $skipSvg) {
+            Write-GraphWarning "Graphviz 'dot' not on PATH. Install from https://graphviz.org/download/ and restart the runner, or set skip_svg=true. Continuing without failing the pipeline."
+            # Still attempt DOT-only generation
+            $skipSvg = $true
+          }
+
+          $argList = @(
+            '-NoProfile'
+            '-File', $script
+            $filename
+            '--Project', $project
+            '-PackagePrefix', $prefix
+          )
+          if ($ignore) {
+            $argList += @('--ignore', $ignore)
+          }
+          if ($skipSvg) {
+            $argList += '-SkipSvg'
+          }
+
+          Write-Host "Invoking: pwsh $($argList -join ' ')"
+          $output = & pwsh @argList 2>&1
+          $exitCode = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host $_ }
+
+          if ($exitCode -ne 0) {
+            $hint = switch ($exitCode) {
+              1 { 'usage / validation' }
+              2 { 'assets / project parse' }
+              3 { 'Graphviz (dot) missing or failed — https://graphviz.org/download/' }
+              default { "unknown ($exitCode)" }
+            }
+            Write-GraphWarning "Script failed ($hint). Pipeline continues. Restore first; confirm Graphviz on PATH; check ignore list."
+            exit 0
+          }
+
+          function Get-OutputValue([string] $name) {
+            $line = $output | Where-Object { $_ -match "^$name=" } | Select-Object -Last 1
+            if (-not $line) { return '' }
+            return ($line -replace "^$name=", '')
+          }
+
+          $dotPath = Get-OutputValue 'DOT_PATH'
+          $svgPath = Get-OutputValue 'SVG_PATH'
+          $pkgCount = Get-OutputValue 'PACKAGE_COUNT'
+          $directCount = Get-OutputValue 'DIRECT_COUNT'
+          $edgeCount = Get-OutputValue 'EDGE_COUNT'
+
+          "succeeded=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "dot_path=$dotPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "svg_path=$svgPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "package_count=$pkgCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "direct_count=$directCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "edge_count=$edgeCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          $summaryIgnored = if ($ignore) { "``$ignore``" } else { '_(none)_' }
+          $summarySvg = if ($svgPath) { $svgPath } else { '(skipped / Graphviz unavailable)' }
+          $summary = (
+            "## WCD dependency graph`n`n" +
+            "| | |`n" +
+            "|---|---|`n" +
+            "| **Project** | ``$project`` |`n" +
+            "| **DOT** | ``$dotPath`` |`n" +
+            "| **SVG** | ``$summarySvg`` |`n" +
+            "| **Packages** | $pkgCount ($directCount direct) |`n" +
+            "| **Edges** | $edgeCount |`n" +
+            "| **Ignored** | $summaryIgnored |`n" +
+            "| **Prefix** | ``$prefix*`` |`n`n" +
+            "View ``docs/app/dependency-graph.svg`` in the repo (committed when ``commit_if_changed`` is true)."
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+          Write-Host "Outputs: dot=$dotPath svg=$svgPath packages=$pkgCount"
+        }
+        catch {
+          Write-GraphWarning $_.Exception.Message
+          exit 0
+        }
+
+    - name: Upload dependency graph artifact
+      if: ${{ inputs.upload_artifact == 'true' && steps.generate.outputs.succeeded == 'true' && steps.generate.outputs.dot_path != '' }}
+      uses: actions/upload-artifact@v4
+      continue-on-error: true
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: |
+          ${{ steps.generate.outputs.dot_path }}
+          ${{ steps.generate.outputs.svg_path }}
+        if-no-files-found: warn
+        retention-days: 30
+
+    - name: Commit dependency graph if changed
+      id: commit
+      if: ${{ inputs.commit_if_changed == 'true' && steps.generate.outputs.succeeded == 'true' }}
+      shell: pwsh
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        DOT_PATH: ${{ steps.generate.outputs.dot_path }}
+        SVG_PATH: ${{ steps.generate.outputs.svg_path }}
+      run: |
+        $ErrorActionPreference = 'Continue'
+        "committed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        try {
+          $files = New-Object System.Collections.Generic.List[string]
+          if ($env:DOT_PATH -and (Test-Path -LiteralPath $env:DOT_PATH)) { $files.Add($env:DOT_PATH) }
+          if ($env:SVG_PATH -and (Test-Path -LiteralPath $env:SVG_PATH)) { $files.Add($env:SVG_PATH) }
+          if ($files.Count -eq 0) {
+            Write-Host "No graph files on disk to commit."
+            exit 0
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- @($files.ToArray())
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Dependency graph unchanged — nothing to commit."
+            exit 0
+          }
+
+          git commit -m "[skip ci] docs: update dependency-graph.dot/svg"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning title=WCD Dependency Graph::git commit failed; pipeline continues."
+            exit 0
+          }
+
+          git pull --rebase --autostash
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning title=WCD Dependency Graph::git pull --rebase failed before push; pipeline continues."
+            exit 0
+          }
+
+          git push
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning title=WCD Dependency Graph::git push failed; pipeline continues. Ensure contents: write and checkout token can push."
+            exit 0
+          }
+
+          "committed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Committed and pushed dependency graph update."
+          if ($env:GITHUB_STEP_SUMMARY) {
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "`nCommitted ``docs/app/dependency-graph.*`` to the default branch (`[skip ci]`)." -Encoding utf8
+          }
+        }
+        catch {
+          Write-Host "::warning title=WCD Dependency Graph::Commit/push failed: $($_.Exception.Message)"
+          exit 0
+        }
