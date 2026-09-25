@@ -1,12 +1,13 @@
 name: 'WCD Dependency Graph'
 description: >
   Generate a Graphviz DOT (+ SVG) graph of wcd-* NuGet dependencies for a .csproj
-  from project.assets.json. Requires a prior restore and Graphviz `dot` on PATH
-  (pre-installed on all WCD runners). Failures emit warnings and do not fail the job.
+  from project.assets.json. Package IDs only — versions omitted so routine bumps
+  do not rewrite committed graph files. Requires a prior restore and Graphviz `dot`
+  on PATH (pre-installed on all WCD runners). Failures emit warnings and do not fail the job.
 
 branding:
   icon: 'share-2'
-  color: 'blue'
+  color: 'blue' 
 
 inputs:
   project:
@@ -207,21 +208,15 @@ runs:
           "direct_count=$directCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "edge_count=$edgeCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          $summaryIgnored = if ($ignore) { "``$ignore``" } else { '_(none)_' }
-          $summarySvg = if ($svgPath) { $svgPath } else { '(skipped / Graphviz unavailable)' }
-          $summary = (
-            "## WCD dependency graph`n`n" +
-            "| | |`n" +
-            "|---|---|`n" +
-            "| **Project** | ``$project`` |`n" +
-            "| **DOT** | ``$dotPath`` |`n" +
-            "| **SVG** | ``$summarySvg`` |`n" +
-            "| **Packages** | $pkgCount ($directCount direct) |`n" +
-            "| **Edges** | $edgeCount |`n" +
-            "| **Ignored** | $summaryIgnored |`n" +
-            "| **Prefix** | ``$prefix*`` |`n`n" +
-            "View ``docs/app/dependency-graph.svg`` in the repo (committed when ``commit_if_changed`` is true)."
-          )
+          $summary = "## WCD dependency graph`n`n"
+          if ($svgPath -and (Test-Path -LiteralPath $svgPath)) {
+            # Job summaries render data-URI images; raw inline <svg> is often stripped.
+            $svgBytes = [System.IO.File]::ReadAllBytes($svgPath)
+            $svgB64 = [Convert]::ToBase64String($svgBytes)
+            $summary += "<img alt=`"wcd-* NuGet dependency graph`" src=`"data:image/svg+xml;base64,$svgB64`" style=`"max-width:100%;height:auto`" />`n"
+          } else {
+            $summary += "_SVG was not generated (see job log). DOT: ``$dotPath``_`n"
+          }
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
           Write-Host "Outputs: dot=$dotPath svg=$svgPath packages=$pkgCount"
         }
@@ -292,9 +287,6 @@ runs:
 
           "committed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Write-Host "Committed and pushed dependency graph update."
-          if ($env:GITHUB_STEP_SUMMARY) {
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "`nCommitted ``docs/app/dependency-graph.*`` to the default branch (`[skip ci]`)." -Encoding utf8
-          }
         }
         catch {
           Write-Host "::warning title=WCD Dependency Graph::Commit/push failed: $($_.Exception.Message)"

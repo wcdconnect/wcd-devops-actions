@@ -8,6 +8,8 @@ Composite action that generates a Graphviz **DOT** + **SVG** graph of `wcd-*` Nu
 
 **Commit back (default):** `commit_if_changed: true` commits and pushes changed graph files with `[skip ci]` so the README image resolves on GitHub.
 
+**Version-free graph:** nodes and edges use package IDs only (no resolved NuGet versions), so routine package bumps do not rewrite the committed graph files.
+
 **No GH Actions artifacts by default:** `upload_artifact` defaults to `false` (avoids accumulating storage cost). Prefer commit-back.
 
 Hub docs: [wcd-devops-github-actions.md — wcd-dependency-graph](https://github.com/wcdconnect/wcd-devops/blob/main/wcd-devops-github-actions.md#wcd-dependency-graph)
