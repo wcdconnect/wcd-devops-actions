@@ -208,17 +208,32 @@ runs:
           "direct_count=$directCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "edge_count=$edgeCount" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          $summary = "## WCD dependency graph`n`n"
-          if ($svgPath -and (Test-Path -LiteralPath $svgPath)) {
-            # Job summaries render data-URI images; raw inline <svg> is often stripped.
-            $svgBytes = [System.IO.File]::ReadAllBytes($svgPath)
-            $svgB64 = [Convert]::ToBase64String($svgBytes)
-            $summary += "<img alt=`"wcd-* NuGet dependency graph`" src=`"data:image/svg+xml;base64,$svgB64`" style=`"max-width:100%;height:auto`" />`n"
-          } else {
-            $summary += "_SVG was not generated (see job log). DOT: ``$dotPath``_`n"
+          $pngPath = ''
+          if ($dotPath -and (Test-Path -LiteralPath $dotPath) -and -not $skipSvg) {
+            $pngPath = [System.IO.Path]::ChangeExtension($dotPath, '.png')
+            $dotExe = if ($dotCmd) { $dotCmd.Source } else { 'dot' }
+            & $dotExe '-Tpng' '-o' $pngPath $dotPath 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $pngPath)) {
+              Write-Host "::warning title=WCD Dependency Graph::PNG render failed; job summary will link to SVG in repo instead."
+              $pngPath = ''
+            }
           }
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
-          Write-Host "Outputs: dot=$dotPath svg=$svgPath packages=$pkgCount"
+
+          $svgRel = ''
+          if ($filename -match '\.dot$') {
+            $svgRel = ($filename -replace '\.dot$', '.svg') -replace '\\', '/'
+          } else {
+            $svgRel = ($filename + '.svg') -replace '\\', '/'
+          }
+          $pngRel = ''
+          if ($pngPath) {
+            $pngRel = ($svgRel -replace '\.svg$', '.png')
+          }
+
+          "png_path=$pngPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "svg_rel=$svgRel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "png_rel=$pngRel" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Outputs: dot=$dotPath svg=$svgPath png=$pngPath packages=$pkgCount"
         }
         catch {
           Write-GraphWarning $_.Exception.Message
@@ -245,6 +260,7 @@ runs:
       env:
         DOT_PATH: ${{ steps.generate.outputs.dot_path }}
         SVG_PATH: ${{ steps.generate.outputs.svg_path }}
+        PNG_PATH: ${{ steps.generate.outputs.png_path }}
       run: |
         $ErrorActionPreference = 'Continue'
         "committed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -252,6 +268,7 @@ runs:
           $files = New-Object System.Collections.Generic.List[string]
           if ($env:DOT_PATH -and (Test-Path -LiteralPath $env:DOT_PATH)) { $files.Add($env:DOT_PATH) }
           if ($env:SVG_PATH -and (Test-Path -LiteralPath $env:SVG_PATH)) { $files.Add($env:SVG_PATH) }
+          if ($env:PNG_PATH -and (Test-Path -LiteralPath $env:PNG_PATH)) { $files.Add($env:PNG_PATH) }
           if ($files.Count -eq 0) {
             Write-Host "No graph files on disk to commit."
             exit 0
@@ -267,7 +284,7 @@ runs:
             exit 0
           }
 
-          git commit -m "[skip ci] docs: update dependency-graph.dot/svg"
+          git commit -m "[skip ci] docs: update dependency-graph.dot/svg/png"
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning title=WCD Dependency Graph::git commit failed; pipeline continues."
             exit 0
@@ -292,3 +309,29 @@ runs:
           Write-Host "::warning title=WCD Dependency Graph::Commit/push failed: $($_.Exception.Message)"
           exit 0
         }
+
+    - name: Write dependency graph job summary
+      if: ${{ steps.generate.outputs.succeeded == 'true' && steps.generate.outputs.svg_rel != '' }}
+      shell: pwsh
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        SVG_REL: ${{ steps.generate.outputs.svg_rel }}
+        PNG_REL: ${{ steps.generate.outputs.png_rel }}
+        GITHUB_REPO: ${{ github.repository }}
+      run: |
+        if (-not $env:GITHUB_STEP_SUMMARY) { exit 0 }
+        $ref = (git rev-parse HEAD).Trim()
+        $repo = $env:GITHUB_REPO
+        $imageRel = if ($env:PNG_REL) { $env:PNG_REL.Trim() } else { $env:SVG_REL.Trim() }
+        $rawUrl = "https://raw.githubusercontent.com/${repo}/${ref}/${imageRel}"
+        $blobUrl = "https://github.com/${repo}/blob/${ref}/${imageRel}"
+        $svgBlob = "https://github.com/${repo}/blob/${ref}/$($env:SVG_REL.Trim())"
+        $summary = @"
+        ## WCD dependency graph
+
+        ![wcd-* NuGet dependency graph]($rawUrl)
+
+        [Open graph in repo]($blobUrl) · [SVG source]($svgBlob)
+        "@
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+        Write-Host "Job summary image: $rawUrl"
