@@ -56,6 +56,13 @@ inputs:
       Soft-fails (warning) if git push fails.
     required: false
     default: 'true'
+  mirror_push_token:
+    description: >
+      Optional PAT with Contents write on wcdconnect/wcd-devops-actions. When set, publishes
+      dependency-graph.png to previews/<owner>/<repo>/ on that public repo so private
+      consumer repos can embed the graph in job summaries (raw.githubusercontent.com 404s on private repos).
+    required: false
+    default: ''
 
 outputs:
   dot_path:
@@ -79,6 +86,9 @@ outputs:
   committed:
     description: 'true when graph files were committed and pushed'
     value: ${{ steps.commit.outputs.committed }}
+  preview_raw_url:
+    description: 'Public raw URL for PNG preview on wcd-devops-actions (empty if mirror push skipped/failed)'
+    value: ${{ steps.mirror.outputs.preview_raw_url }}
 
 runs:
   using: 'composite'
@@ -252,6 +262,42 @@ runs:
         if-no-files-found: warn
         retention-days: 30
 
+    - name: Publish graph preview to wcd-devops-actions
+      id: mirror
+      if: ${{ inputs.mirror_push_token != '' && steps.generate.outputs.succeeded == 'true' && steps.generate.outputs.png_path != '' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        MIRROR_TOKEN: ${{ inputs.mirror_push_token }}
+        PNG_PATH: ${{ steps.generate.outputs.png_path }}
+        REPO_SLUG: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        preview_raw_url=""
+        echo "preview_raw_url=" >> "$GITHUB_OUTPUT"
+        if [ -z "${MIRROR_TOKEN}" ]; then
+          exit 0
+        fi
+        work="${RUNNER_TEMP}/wcd-devops-actions-mirror"
+        rm -rf "$work"
+        git clone --depth 1 "https://x-access-token:${MIRROR_TOKEN}@github.com/wcdconnect/wcd-devops-actions.git" "$work"
+        dest_dir="${work}/previews/${REPO_SLUG}"
+        mkdir -p "$dest_dir"
+        cp "$PNG_PATH" "${dest_dir}/dependency-graph.png"
+        cd "$work"
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add "previews/${REPO_SLUG}/dependency-graph.png"
+        if git diff --cached --quiet; then
+          echo "Graph preview unchanged on public mirror."
+        else
+          git commit -m "preview: ${REPO_SLUG} dependency graph [skip ci]"
+          git push origin HEAD:main
+        fi
+        preview_raw_url="https://raw.githubusercontent.com/wcdconnect/wcd-devops-actions/main/previews/${REPO_SLUG}/dependency-graph.png"
+        echo "preview_raw_url=${preview_raw_url}" >> "$GITHUB_OUTPUT"
+        echo "Preview URL: ${preview_raw_url}"
+
     - name: Commit dependency graph if changed
       id: commit
       if: ${{ inputs.commit_if_changed == 'true' && steps.generate.outputs.succeeded == 'true' }}
@@ -307,7 +353,12 @@ runs:
         }
         catch {
           Write-Host "::warning title=WCD Dependency Graph::Commit/push failed: $($_.Exception.Message)"
-          exit 0
+        }
+        finally {
+          $ref = (git rev-parse HEAD 2>$null)
+          if ($ref) {
+            "graph_ref_sha=$ref" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
         }
 
     - name: Write dependency graph job summary
@@ -318,20 +369,44 @@ runs:
         SVG_REL: ${{ steps.generate.outputs.svg_rel }}
         PNG_REL: ${{ steps.generate.outputs.png_rel }}
         GITHUB_REPO: ${{ github.repository }}
+        REPO_PRIVATE: ${{ github.event.repository.private }}
+        PREVIEW_RAW_URL: ${{ steps.mirror.outputs.preview_raw_url }}
+        GRAPH_REF_SHA: ${{ steps.commit.outputs.graph_ref_sha }}
+        PKG_COUNT: ${{ steps.generate.outputs.package_count }}
+        DIRECT_COUNT: ${{ steps.generate.outputs.direct_count }}
+        EDGE_COUNT: ${{ steps.generate.outputs.edge_count }}
       run: |
         if (-not $env:GITHUB_STEP_SUMMARY) { exit 0 }
-        $ref = (git rev-parse HEAD).Trim()
+        $ref = if ($env:GRAPH_REF_SHA) { $env:GRAPH_REF_SHA.Trim() } else { (git rev-parse HEAD).Trim() }
         $repo = $env:GITHUB_REPO
-        $imageRel = if ($env:PNG_REL) { $env:PNG_REL.Trim() } else { $env:SVG_REL.Trim() }
-        $rawUrl = "https://raw.githubusercontent.com/${repo}/${ref}/${imageRel}"
-        $blobUrl = "https://github.com/${repo}/blob/${ref}/${imageRel}"
-        $svgBlob = "https://github.com/${repo}/blob/${ref}/$($env:SVG_REL.Trim())"
-        $summary = @"
-        ## WCD dependency graph
-
-        ![wcd-* NuGet dependency graph]($rawUrl)
-
-        [Open graph in repo]($blobUrl) · [SVG source]($svgBlob)
-        "@
-        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
-        Write-Host "Job summary image: $rawUrl"
+        $svgRel = $env:SVG_REL.Trim()
+        $pngRel = if ($env:PNG_REL) { $env:PNG_REL.Trim() } else { '' }
+        $previewUrl = if ($env:PREVIEW_RAW_URL) { $env:PREVIEW_RAW_URL.Trim() } else { '' }
+        $isPrivate = $env:REPO_PRIVATE -eq 'true'
+        $blobPng = if ($pngRel) { "https://github.com/${repo}/blob/${ref}/${pngRel}" } else { '' }
+        $blobSvg = "https://github.com/${repo}/blob/${ref}/${svgRel}"
+        $lines = @(
+          '## WCD dependency graph',
+          '',
+          "| Packages | Direct | Edges |",
+          "|----------|--------|-------|",
+          "| $($env:PKG_COUNT) | $($env:DIRECT_COUNT) | $($env:EDGE_COUNT) |",
+          ''
+        )
+        if ($previewUrl) {
+          $lines += "![wcd-* NuGet dependency graph]($previewUrl)"
+          $lines += ''
+          $lines += "_Preview hosted on public [\`wcd-devops-actions\`](https://github.com/wcdconnect/wcd-devops-actions) (package names only)._"
+        }
+        elseif (-not $isPrivate -and $pngRel) {
+          $rawUrl = "https://raw.githubusercontent.com/${repo}/${ref}/${pngRel}"
+          $lines += "![wcd-* NuGet dependency graph]($rawUrl)"
+        }
+        else {
+          $lines += "**Private repo:** \`raw.githubusercontent.com\` returns 404 without auth, so job summaries cannot embed repo-local images."
+          $lines += "Set org/repo secret \`WCD_DEVOPS_ACTIONS_WRITE_TOKEN\` (PAT with write on \`wcd-devops-actions\`) and pass \`mirror_push_token\` to this action for an inline preview."
+        }
+        $lines += ''
+        $lines += "[SVG in repo]($blobSvg)"
+        if ($blobPng) { $lines += " · [PNG in repo]($blobPng)" }
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join "`n") -Encoding utf8
