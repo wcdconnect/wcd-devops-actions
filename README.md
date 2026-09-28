@@ -1,8 +1,6 @@
 # WCD DevOps Actions
 
-Lightweight composite actions for org-wide WCD CI/CD (dependency graphs, shared tooling).
-
-**This repository is auto-generated.** The source of truth lives in [wcd-devops](https://github.com/wcdconnect/wcd-devops) at [`.github/actions/wcd-actions/`](https://github.com/wcdconnect/wcd-devops/tree/main/.github/actions/wcd-actions). Changes are synced here automatically whenever those source files change on `main`.
+Public mirror for composite actions synced from [wcd-devops](https://github.com/wcdconnect/wcd-devops) (`.github/actions/wcd-actions/`).
 
 Do not edit files in this repository directly. Submit changes to **wcd-devops** instead.
 
@@ -10,26 +8,23 @@ Do not edit files in this repository directly. Submit changes to **wcd-devops** 
 
 ## Actions
 
-| Action | Purpose |
-|--------|---------|
-| **[wcd-dependency-graph](wcd-dependency-graph/)** | Generate `wcd-*` NuGet DOT + SVG dependency graphs; commit `docs/app/dependency-graph.*` by default (no GH Actions artifact upload) |
+There are no composite actions published at the moment.
 
-## Usage
+## Dependency graphs (local only)
 
-```yaml
-steps:
-  - uses: actions/checkout@v4
-    with:
-      token: ${{ secrets.GITHUB_TOKEN }}   # needs contents: write to commit graphs
+NuGet dependency graphs are **not** generated in CI. Regenerate and commit `docs/app/dependency-graph.dot` / `.svg` locally when the graph changes:
 
-  - run: dotnet restore My.sln
-
-  - uses: wcdconnect/wcd-devops-actions/wcd-dependency-graph@main
-    with:
-      project: src/my-app/my-app.csproj
-      ignore: wcd-library-targets
+```powershell
+# From wcd-devops (or copy scripts/create-dependency-graph.ps1)
+.\scripts\create-dependency-graph.ps1 docs/app/dependency-graph `
+  --Project src/my-app/my-app.csproj `
+  --ignore wcd-library-targets
 ```
 
-Defaults: `commit_if_changed: true`, `upload_artifact: false`.
+Embed in README:
 
-Full documentation: [wcd-devops-github-actions.md](https://github.com/wcdconnect/wcd-devops/blob/main/wcd-devops-github-actions.md#wcd-dependency-graph).
+```markdown
+![wcd-* NuGet dependency graph](docs/app/dependency-graph.svg)
+```
+
+Full documentation: [wcd-devops-github-actions.md — Dependency graphs](https://github.com/wcdconnect/wcd-devops/blob/main/wcd-devops-github-actions.md#dependency-graphs-local).
